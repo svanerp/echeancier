@@ -192,7 +192,7 @@ with st.expander("ℹ️ Guide des types de mouvements"):
 """)
     
 # ── Table des mouvements ──────────────────────────────────────────────────────
-st.subheader("Mouvements")
+st.subheader("Plan de dépenses et revenus")
 
 FREQ_OPTIONS = ["1 / mois", "1 / an", "revenu", "unique", "emprunt", "souhait"]
 
