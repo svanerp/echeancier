@@ -1,4 +1,5 @@
 import io
+import plotly.graph_objects as go
 import streamlit as st
 import pandas as pd
 from datetime import datetime, date
@@ -36,7 +37,7 @@ _TYPE_MAP = {
 }
 
 
-def _df_to_csv(df: pd.DataFrame) -> str:
+def _df_to_csv(df: pd.DataFrame, start_amount: float, start_date, nb_month: int) -> str:
     """Convertit le DataFrame de la vue vers le format CSV d'origine."""
     def fmt_date(d):
         if d is None or (isinstance(d, float) and pd.isna(d)):
@@ -61,19 +62,30 @@ def _df_to_csv(df: pd.DataFrame) -> str:
             "active":      "" if row.get("active", True) else "false",
         })
 
+    header = (
+        f"#solde_initial={start_amount}\n"
+        f"#date_debut={fmt_date(start_date)}\n"
+        f"#nb_mois={nb_month}\n"
+    )
     out = pd.DataFrame(rows)
-    return out.to_csv(sep=";", index=False)
+    return header + out.to_csv(sep=";", index=False)
 
 
-def _csv_to_df(content: str) -> tuple[pd.DataFrame, list[str]]:
-    """Parse le contenu CSV et retourne (DataFrame, liste d'erreurs)."""
+def _csv_to_df(content: str) -> tuple[pd.DataFrame, list[str], dict]:
+    """Parse le contenu CSV et retourne (DataFrame, liste d'erreurs, paramètres)."""
     errors = []
     rows = []
+    params = {}
+    for line in content.splitlines():
+        if line.startswith("#"):
+            key, _, val = line[1:].partition("=")
+            params[key.strip()] = val.strip()
     reader = pd.read_csv(
         io.StringIO(content),
         sep=";",
         dtype=str,
         keep_default_na=False,
+        comment="#",
     )
     # Normalise les noms de colonnes (strip + lowercase)
     reader.columns = [c.strip().lower() for c in reader.columns]
@@ -119,7 +131,7 @@ def _csv_to_df(content: str) -> tuple[pd.DataFrame, list[str]]:
             "active":        active,
         })
 
-    return pd.DataFrame(rows) if rows else pd.DataFrame(), errors
+    return pd.DataFrame(rows) if rows else pd.DataFrame(), errors, params
 
 with st.expander("📥 Chargement des données", expanded=True):
     uploaded_file = st.file_uploader(
@@ -130,7 +142,7 @@ with st.expander("📥 Chargement des données", expanded=True):
 
     if uploaded_file is not None and uploaded_file.name != st.session_state.get("loaded_file"):
         content = uploaded_file.read().decode("utf-8")
-        df_loaded, load_errors = _csv_to_df(content)
+        df_loaded, load_errors, params = _csv_to_df(content)
         if load_errors:
             for err in load_errors:
                 st.warning(err)
@@ -138,6 +150,20 @@ with st.expander("📥 Chargement des données", expanded=True):
             st.session_state.mouvements_df = df_loaded
             st.session_state.loaded_file = uploaded_file.name
             st.session_state.pop("data_editor", None)
+            if "solde_initial" in params:
+                try:
+                    st.session_state.param_solde_initial = float(params["solde_initial"])
+                except ValueError:
+                    pass
+            if "date_debut" in params:
+                d = _parse_date(params["date_debut"])
+                if d:
+                    st.session_state.param_date_debut = d
+            if "nb_mois" in params:
+                try:
+                    st.session_state.param_nb_mois = int(params["nb_mois"])
+                except ValueError:
+                    pass
             st.success(f"{len(df_loaded)} mouvement(s) chargé(s) depuis « {uploaded_file.name} ».")
         elif not load_errors:
             st.error("Aucun mouvement valide trouvé dans le fichier.")
@@ -146,11 +172,11 @@ with st.expander("📥 Chargement des données", expanded=True):
 with st.expander("⚙️ Paramètres de l'échéancier", expanded=True):
     col1, col2, col3 = st.columns(3)
     with col1:
-        start_amount = st.number_input("Solde initial (€)", value=0.0, step=100.0)
+        start_amount = st.number_input("Solde initial (€)", value=st.session_state.get("param_solde_initial", 0.0), step=100.0)
     with col2:
-        start_date = st.date_input("Date de début", value=date.today().replace(day=1))
+        start_date = st.date_input("Date de début", value=st.session_state.get("param_date_debut", date.today().replace(day=1)))
     with col3:
-        nb_month = st.number_input("Nombre de mois", min_value=1, max_value=360, value=24, step=1)
+        nb_month = st.number_input("Nombre de mois", min_value=1, max_value=360, value=st.session_state.get("param_nb_mois", 24), step=1)
 
 # ── Aide ─────────────────────────────────────────────────────────────────────
 with st.expander("ℹ️ Guide des types de mouvements"):
@@ -190,7 +216,7 @@ if "mouvements_df" not in st.session_state:
 edited_df = st.data_editor(
     st.session_state.mouvements_df,
     num_rows="dynamic",
-    use_container_width=True,
+    width='stretch',
     column_config={
         "type": st.column_config.SelectboxColumn(
             "Type",
@@ -227,11 +253,9 @@ edited_df = st.data_editor(
     column_order=["active", "type", "description", "montant", "date_debut", "date_fin", "mensualite", "nb_mois", "interruptible"],
     key="data_editor",
 )
-st.session_state.mouvements_df = edited_df
-
 st.download_button(
     label="💾 Sauvegarder en CSV",
-    data=_df_to_csv(edited_df),
+    data=_df_to_csv(edited_df, start_amount, start_date, nb_month),
     file_name="echeancier.csv",
     mime="text/csv",
 )
@@ -350,6 +374,8 @@ if st.button("▶ Calculer l'échéancier", type="primary"):
             st.success(f"{len(result_df)} opérations calculées.")
 
             # Graphique : dernier solde connu par mois
+            MOIS_FR = ["janv.", "févr.", "mars", "avr.", "mai", "juin",
+                       "juil.", "août", "sept.", "oct.", "nov.", "déc."]
             chart_df = (
                 result_df
                 .set_index("Date")["Solde (€)"]
@@ -357,20 +383,36 @@ if st.button("▶ Calculer l'échéancier", type="primary"):
                 .last()
                 .dropna()
             )
-            st.line_chart(chart_df)
-
+            labels = [f"{MOIS_FR[d.month-1]} {d.year}" for d in chart_df.index]
+            year_end_mask = chart_df.index.month == 12
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=labels, y=chart_df.values,
+                mode="lines", name="Solde",
+            ))
+            fig.add_trace(go.Scatter(
+                x=[l for l, m in zip(labels, year_end_mask) if m],
+                y=chart_df[year_end_mask].values,
+                mode="markers",
+                marker=dict(color="red", size=10, symbol="circle"),
+                name="Fin d'année",
+            ))
+            st.plotly_chart(fig, width="stretch")
+          
             # Tableau : date affichée en DD/MM/YYYY
+            year_end_rows = (result_df["Date"].dt.month == 1) & (result_df["Date"].dt.day == 1)
             result_df["Date"] = result_df["Date"].dt.strftime("%d/%m/%Y")
 
             # Tableau détaillé
+            def _highlight_year_end(row):
+                color = "background-color: #ffcccc" if year_end_rows[row.name] else ""
+                return [color] * len(row)
+
             st.dataframe(
-                result_df,
-                use_container_width=True,
+                result_df.style.apply(_highlight_year_end, axis=1)
+                    .format({"Montant (€)": "{:.2f} €", "Solde (€)": "{:.2f} €"}),
+                width='stretch',
                 hide_index=True,
-                column_config={
-                    "Montant (€)": st.column_config.NumberColumn(format="%.2f €"),
-                    "Solde (€)": st.column_config.NumberColumn(format="%.2f €"),
-                },
             )
 
         except Exception as e:
