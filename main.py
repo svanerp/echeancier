@@ -3,6 +3,7 @@ import plotly.graph_objects as go
 import streamlit as st
 import pandas as pd
 from datetime import datetime, date
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode, JsCode
 from models import (
     Movement, Income, MovementOneShot, MovementAnnuel, MovementInterval,
     MovementRemboursement, MovementRemboursementNb, Souhait, Echeancier
@@ -10,6 +11,40 @@ from models import (
 
 st.set_page_config(page_title="Échéancier", layout="wide")
 st.title("Échéancier financier")
+
+
+# ── Helpers AgGrid ───────────────────────────────────────────────────────────
+_GRID_COLUMNS = ["active", "type", "description", "montant", "date_debut", "date_fin", "mensualite", "nb_mois", "interruptible"]
+
+def _df_for_grid(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy().reset_index(drop=True)
+    for col in ["date_debut", "date_fin"]:
+        df[col] = df[col].apply(
+            lambda d: d.strftime("%d/%m/%Y") if hasattr(d, "strftime") else ""
+        )
+    df["active"] = df["active"].fillna(True).astype(bool)
+    df["interruptible"] = df["interruptible"].fillna(False).astype(bool)
+    df["montant"] = pd.to_numeric(df["montant"], errors="coerce").fillna(0.0)
+    return df[_GRID_COLUMNS]
+
+
+def _df_from_grid(data) -> pd.DataFrame:
+    df = data.copy() if isinstance(data, pd.DataFrame) else pd.DataFrame(data)
+    if df.empty:
+        return df
+    for col in ["date_debut", "date_fin"]:
+        if col in df.columns:
+            df[col] = df[col].apply(lambda d: _parse_date(str(d)) if d else None)
+    df["montant"] = pd.to_numeric(df["montant"], errors="coerce").fillna(0.0)
+    df["mensualite"] = pd.to_numeric(df["mensualite"], errors="coerce")
+    df["nb_mois"] = pd.to_numeric(df["nb_mois"], errors="coerce")
+    df["active"] = df["active"].apply(
+        lambda x: x if isinstance(x, bool) else str(x).lower() not in ("false", "0", "")
+    )
+    df["interruptible"] = df["interruptible"].apply(
+        lambda x: x if isinstance(x, bool) else str(x).lower() == "true"
+    )
+    return df.reset_index(drop=True)
 
 
 # ── Chargement de fichier CSV ─────────────────────────────────────────────────
@@ -52,6 +87,7 @@ def _df_to_csv(df: pd.DataFrame, start_amount: float, start_date, nb_month: int)
     rows = []
     for _, row in df.dropna(how="all").iterrows():
         rows.append({
+            "active":      "" if row.get("active", True) else "false",
             "frequency":   row.get("type", ""),
             "description": row.get("description", ""),
             "amount":      row.get("montant", ""),
@@ -59,7 +95,6 @@ def _df_to_csv(df: pd.DataFrame, start_amount: float, start_date, nb_month: int)
             "end_date":    fmt_date(row.get("date_fin")),
             "a":           row.get("mensualite", "") if pd.notna(row.get("mensualite")) else "",
             "remb":        "yes" if row.get("interruptible") else "",
-            "active":      "" if row.get("active", True) else "false",
         })
 
     header = (
@@ -147,12 +182,21 @@ with st.expander("📥 Chargement des données", expanded=True):
             for err in load_errors:
                 st.warning(err)
         if not df_loaded.empty:
-            st.session_state.mouvements_df = df_loaded
+            existing_df = st.session_state.get("mouvements_df")
+            has_existing = existing_df is not None and not existing_df.empty and not (
+                len(existing_df) == 1 and existing_df.iloc[0]["description"] == ""
+            )
+            if has_existing:
+                st.session_state.mouvements_df = pd.concat([existing_df, df_loaded], ignore_index=True)
+            else:
+                st.session_state.mouvements_df = df_loaded
             st.session_state.loaded_file = uploaded_file.name
-            st.session_state.pop("data_editor", None)
+            st.session_state.pop("ag_grid", None)
             if "solde_initial" in params:
                 try:
-                    st.session_state.param_solde_initial = float(params["solde_initial"])
+                    new_solde = float(params["solde_initial"])
+                    current_solde = st.session_state.get("param_solde_initial", 0.0)
+                    st.session_state.param_solde_initial = current_solde + new_solde
                 except ValueError:
                     pass
             if "date_debut" in params:
@@ -164,7 +208,8 @@ with st.expander("📥 Chargement des données", expanded=True):
                     st.session_state.param_nb_mois = int(params["nb_mois"])
                 except ValueError:
                     pass
-            st.success(f"{len(df_loaded)} mouvement(s) chargé(s) depuis « {uploaded_file.name} ».")
+            msg = f"{len(df_loaded)} mouvement(s) ajouté(s) depuis « {uploaded_file.name} »." if has_existing else f"{len(df_loaded)} mouvement(s) chargé(s) depuis « {uploaded_file.name} »."
+            st.success(msg)
         elif not load_errors:
             st.error("Aucun mouvement valide trouvé dans le fichier.")
 
@@ -212,47 +257,85 @@ default_data = pd.DataFrame([
 
 if "mouvements_df" not in st.session_state:
     st.session_state.mouvements_df = default_data.copy()
+if "grid_key" not in st.session_state:
+    st.session_state.grid_key = 0
+if "scroll_to_last" not in st.session_state:
+    st.session_state.scroll_to_last = False
 
-edited_df = st.data_editor(
-    st.session_state.mouvements_df,
-    num_rows="dynamic",
-    width='stretch',
-    column_config={
-        "type": st.column_config.SelectboxColumn(
-            "Type",
-            options=FREQ_OPTIONS,
-            required=True,
-            width="small",
-        ),
-        "description": st.column_config.TextColumn("Description", width="medium"),
-        "montant": st.column_config.NumberColumn("Montant (€)", format="%.2f", width="small"),
-        "date_debut": st.column_config.DateColumn("Date début", width="small"),
-        "date_fin": st.column_config.DateColumn("Date fin", width="small"),
-        "mensualite": st.column_config.NumberColumn(
-            "Mensualité (€)",
-            help="Pour emprunt : montant de la mensualité (optionnel si date fin fournie)",
-            format="%.2f",
-            width="small",
-        ),
-        "nb_mois": st.column_config.NumberColumn(
-            "Nb mois",
-            help="Pour emprunt : nombre de mensualités (alternative à date fin)",
-            width="small",
-        ),
-        "active": st.column_config.CheckboxColumn(
-            "Actif",
-            help="Décocher pour exclure ce mouvement du calcul",
-            width="small",
-        ),
-        "interruptible": st.column_config.CheckboxColumn(
-            "Interruptible",
-            help="Remboursement anticipé si solde suffisant",
-            width="small",
-        ),
-    },
-    column_order=["active", "type", "description", "montant", "date_debut", "date_fin", "mensualite", "nb_mois", "interruptible"],
-    key="data_editor",
+gb = GridOptionsBuilder.from_dataframe(_df_for_grid(st.session_state.mouvements_df))
+gb.configure_default_column(editable=True, resizable=True, sortable=False, filter=False)
+gb.configure_column("active", headerName="Actif", width=75,
+                     cellRenderer="agCheckboxCellRenderer",
+                     cellEditor="agCheckboxCellEditor", rowDrag=True)
+gb.configure_column("type", headerName="Type", width=120,
+                     cellEditor="agSelectCellEditor",
+                     cellEditorParams={"values": FREQ_OPTIONS})
+gb.configure_column("description", headerName="Description", flex=2, minWidth=150)
+gb.configure_column("montant", headerName="Montant (€)", width=120, type=["numericColumn"])
+gb.configure_column("date_debut", headerName="Date début", width=110)
+gb.configure_column("date_fin", headerName="Date fin", width=110)
+gb.configure_column("mensualite", headerName="Mensualité (€)", width=130, type=["numericColumn"])
+gb.configure_column("nb_mois", headerName="Nb mois", width=90, type=["numericColumn"])
+gb.configure_column("interruptible", headerName="Interruptible", width=115,
+                     cellRenderer="agCheckboxCellRenderer",
+                     cellEditor="agCheckboxCellEditor")
+gb.configure_selection("single", use_checkbox=False)
+grid_opts = gb.build()
+grid_opts["rowDragManaged"] = True
+grid_opts["animateRows"] = True
+if st.session_state.scroll_to_last:
+    last_idx = len(st.session_state.mouvements_df) - 1
+    grid_opts["onFirstDataRendered"] = JsCode(f"""
+        function(params) {{
+            params.api.ensureIndexVisible({last_idx}, 'bottom');
+            params.api.setFocusedCell({last_idx}, 'description');
+            params.api.startEditingCell({{rowIndex: {last_idx}, colKey: 'description'}});
+        }}
+    """)
+    st.session_state.scroll_to_last = False
+
+response = AgGrid(
+    _df_for_grid(st.session_state.mouvements_df),
+    gridOptions=grid_opts,
+    update_mode=GridUpdateMode.MODEL_CHANGED,
+    data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+    fit_columns_on_grid_load=True,
+    allow_unsafe_jscode=True,
+    height=300,
+    key=f"ag_grid_{st.session_state.grid_key}",
 )
+edited_df = _df_from_grid(response["data"])
+if edited_df.empty:
+    edited_df = st.session_state.mouvements_df.copy()
+
+col_add, col_del, _ = st.columns([1, 1, 6])
+with col_add:
+    if st.button("➕ Ajouter une ligne"):
+        new_row = pd.DataFrame([{
+            "active": True, "type": "unique", "description": "une description",
+            "montant": 0.0, "date_debut": date.today().replace(day=1),
+            "date_fin": None, "mensualite": None, "nb_mois": None, "interruptible": False,
+        }])
+        base = edited_df if not edited_df.empty else st.session_state.mouvements_df
+        st.session_state.mouvements_df = pd.concat([base, new_row], ignore_index=False)
+        st.session_state.scroll_to_last = True
+        st.session_state.grid_key += 1
+        st.rerun()
+with col_del:
+    _sel = response.get("selected_rows")
+    selected = _sel.to_dict("records") if isinstance(_sel, pd.DataFrame) else (_sel or [])
+    if st.button("🗑 Supprimer la ligne", disabled=len(selected) == 0):
+        sel = selected[0]
+        base = st.session_state.mouvements_df
+        mask = pd.Series([True] * len(base))
+        for col in ["type", "description", "montant", "date_debut", "date_fin"]:
+            if col in sel:
+                mask &= base[col].astype(str) == str(sel[col])
+        idx = mask.idxmax() if mask.any() else None
+        if idx is not None:
+            st.session_state.mouvements_df = base.drop(index=idx).reset_index(drop=True)
+            st.session_state.pop("ag_grid", None)
+            st.rerun()
 st.download_button(
     label="💾 Sauvegarder en CSV",
     data=_df_to_csv(edited_df, start_amount, start_date, nb_month),
@@ -357,19 +440,22 @@ if st.button("▶ Calculer l'échéancier", type="primary"):
 
             # Mise à plat du bilan
             rows = []
-            for dt, entries in sorted(ech.balance.items()):
+            for dt, entries in ech.balance.items():
                 for entry in entries:
                     rows.append({
-                        "Date": entry.date,                          # datetime, pour le tri
+                        "Date": entry.date,
                         "Description": entry.payement.description,
                         "Montant (€)": round(entry.payement.amount, 2),
                         "Solde (€)": round(entry.current_amount, 2),
                         "Spécial": "✔" if entry.payement.special else "",
+                        "_order": entry.payement.order,
                     })
 
             result_df = pd.DataFrame(rows)
             result_df["Date"] = pd.to_datetime(result_df["Date"])
-            result_df.sort_values("Date", inplace=True)
+            result_df.sort_values("_order", inplace=True)
+            result_df.drop(columns=["_order"], inplace=True)
+            result_df.reset_index(drop=True, inplace=True)
 
             st.success(f"{len(result_df)} opérations calculées.")
 
@@ -413,6 +499,16 @@ if st.button("▶ Calculer l'échéancier", type="primary"):
                     .format({"Montant (€)": "{:.2f} €", "Solde (€)": "{:.2f} €"}),
                 width='stretch',
                 hide_index=True,
+            )
+
+            xlsx_buf = io.BytesIO()
+            with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
+                result_df.to_excel(writer, index=False, sheet_name="Paiements")
+            st.download_button(
+                label="📥 Télécharger en Excel",
+                data=xlsx_buf.getvalue(),
+                file_name="echeancier.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
         except Exception as e:

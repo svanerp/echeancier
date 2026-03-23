@@ -16,7 +16,8 @@ class Movement:
     def __init__(self, description, amount, start_date, income=False, interval=-1, end_date=None, active=True):
         self.active = active
         self.description = description
-        self.amount = Movement._compute_amount(amount, income)
+        self.amount = amount
+        # self.amount = Movement._compute_amount(amount, income)
         self.income = income
         self.start_date = start_date
         self.start_date_first_day = datetime(start_date.year, start_date.month, 1)
@@ -30,12 +31,12 @@ class Movement:
             self.end_date = end_date
         self.interuptible = False
 
-    @staticmethod
-    def _compute_amount(amount, income):
-        if income:
-            return abs(amount)
-        else:
-            return amount if amount < 0 else amount * -1
+    # @staticmethod
+    # def _compute_amount(amount, income):
+    #     if income:
+    #         return abs(amount)
+    #     else:
+    #         return amount if amount < 0 else amount * -1
 
     def match(self, date):
         '''
@@ -157,6 +158,7 @@ class Payement:
         self.mouvement = movement
         self.interuptible = False if movement is None else movement.interuptible
         self.special = False
+        self.order = 0
 
     def __repr__(self):
         return '%s %s %s' % (self.description, self.date, self.amount)
@@ -203,6 +205,7 @@ class Echeancier:
         # Création des paiements
         interrupted_movements = []
         current_amount = self.start_amount
+        self._order_counter = 0
         for pay in sorted(self.payments):
             so, am = self.check_souhait(current_amount, pay)
             if so is None:
@@ -214,7 +217,7 @@ class Echeancier:
                         if len(self.appurements) > 0 and pay.mouvement == self.appurements[0]:
                             if pay.mouvement not in self.ended:
                                 if current_amount > pay.mouvement.compute_residual(pay.date):
-                                    if not 'after' in pay.mouvement.__dict__ or pay.mouvement.after < pay.date:    
+                                    if not 'after' in pay.mouvement.__dict__ or pay.mouvement.after < pay.date:
                                         pay.special = True
                                         pay.amount = pay.mouvement.compute_residual(pay.date) * -1
                                         self.appurements.remove(pay.mouvement)
@@ -268,6 +271,8 @@ class Echeancier:
         return None, False
 
     def add_entry(self, pay, current_amount):
+        pay.order = self._order_counter
+        self._order_counter += 1
         if pay.date in self.balance:
             self.balance[pay.date].append(BalanceEntry(pay.date, current_amount, pay))
         else:
